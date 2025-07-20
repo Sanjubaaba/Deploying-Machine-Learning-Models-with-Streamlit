@@ -1,0 +1,337 @@
+# app.py - Complete ML Deployment with Streamlit and SQL Server
+import streamlit as st
+import pandas as pd
+import pyodbc
+import pickle
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+
+# ======================
+# DATABASE SETUP (DDL)
+# ======================
+def initialize_database():
+    """Create database tables if they don't exist"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if tables exist
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ModelInputs' AND xtype='U')
+            CREATE TABLE ModelInputs (
+                InputID INT IDENTITY(1,1) PRIMARY KEY,
+                Age FLOAT,
+                Income FLOAT,
+                CreditScore FLOAT,
+                LoanAmount FLOAT,
+                InputDate DATETIME DEFAULT GETDATE()
+            )
+        """)
+        
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Predictions' AND xtype='U')
+            CREATE TABLE Predictions (
+                PredictionID INT IDENTITY(1,1) PRIMARY KEY,
+                InputID INT FOREIGN KEY REFERENCES ModelInputs(InputID),
+                PredictionValue INT,
+                PredictionDate DATETIME DEFAULT GETDATE(),
+                Confidence FLOAT,
+                Probability_0 FLOAT,
+                Probability_1 FLOAT
+            )
+        """)
+        
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ModelPerformance' AND xtype='U')
+            CREATE TABLE ModelPerformance (
+                PerformanceID INT IDENTITY(1,1) PRIMARY KEY,
+                MetricName VARCHAR(50),
+                MetricValue FLOAT,
+                MeasurementDate DATETIME DEFAULT GETDATE()
+            )
+        """)
+        
+        conn.commit()
+        cursor.close()
+        st.success("Database tables initialized successfully!")
+    except Exception as e:
+        st.error(f"Database initialization failed: {str(e)}")
+
+# ======================
+# DATABASE CONNECTION
+# ======================
+@st.cache_resource
+def get_db_connection():
+    """Establish connection to SQL Server"""
+    try:
+        server = st.secrets.get("DB_SERVER", "localhost")
+        database = st.secrets.get("DB_NAME", "MLDeployment")
+        username = st.secrets.get("DB_USER", "sa")
+        password = st.secrets.get("DB_PASSWORD", "your_password")
+        driver = '{ODBC Driver 17 for SQL Server}'
+        
+        connection_string = f'DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password}'
+        conn = pyodbc.connect(connection_string)
+        return conn
+    except Exception as e:
+        st.error(f"Database connection failed: {str(e)}")
+        return None
+
+# ======================
+# MACHINE LEARNING MODEL
+# ======================
+@st.cache_resource
+def load_model():
+    """Load or train a machine learning model"""
+    try:
+        # For demo purposes, we'll create and train a simple model
+        # In production, you would load a pre-trained model
+        X, y = make_classification(
+            n_samples=1000,
+            n_features=4,
+            n_informative=2,
+            n_redundant=0,
+            random_state=42
+        )
+        
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X, y)
+        return model
+    except Exception as e:
+        st.error(f"Model loading failed: {str(e)}")
+        return None
+
+# ======================
+# DATABASE OPERATIONS (DML)
+# ======================
+def save_input_to_db(input_data):
+    """Save user input to database"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO ModelInputs (Age, Income, CreditScore, LoanAmount)
+                VALUES (?, ?, ?, ?)
+            """, *input_data)
+            conn.commit()
+            
+            # Get the inserted ID
+            cursor.execute("SELECT SCOPE_IDENTITY()")
+            input_id = cursor.fetchone()[0]
+            cursor.close()
+            return input_id
+        except Exception as e:
+            st.error(f"Failed to save input: {str(e)}")
+            return None
+
+def save_prediction_to_db(input_id, prediction, probabilities):
+    """Save prediction results to database"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO Predictions (
+                    InputID, PredictionValue, Confidence,
+                    Probability_0, Probability_1
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, input_id, int(prediction), float(max(probabilities)),
+                          float(probabilities[0]), float(probabilities[1]))
+            conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            st.error(f"Failed to save prediction: {str(e)}")
+            return False
+
+def get_historical_data(limit=100):
+    """Retrieve historical predictions"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            query = f"""
+                SELECT TOP {limit} 
+                    i.InputID, i.Age, i.Income, i.CreditScore, i.LoanAmount, i.InputDate,
+                    p.PredictionValue, p.Confidence, p.PredictionDate,
+                    p.Probability_0, p.Probability_1
+                FROM ModelInputs i
+                JOIN Predictions p ON i.InputID = p.InputID
+                ORDER BY p.PredictionDate DESC
+            """
+            df = pd.read_sql(query, conn)
+            return df
+        except Exception as e:
+            st.error(f"Failed to fetch historical data: {str(e)}")
+            return pd.DataFrame()
+
+# ======================
+# STREAMLIT UI COMPONENTS
+# ======================
+def input_form():
+    """Render the input form for predictions"""
+    with st.form("prediction_form"):
+        st.subheader("Loan Approval Prediction")
+        
+        age = st.slider("Age", 18, 100, 30)
+        income = st.number_input("Annual Income ($)", 10000, 500000, 50000, step=1000)
+        credit_score = st.slider("Credit Score", 300, 850, 700)
+        loan_amount = st.number_input("Loan Amount ($)", 1000, 500000, 20000, step=1000)
+        
+        submitted = st.form_submit_button("Predict Loan Approval")
+        
+        if submitted:
+            return [age, income, credit_score, loan_amount]
+    return None
+
+def display_prediction_result(prediction, probabilities):
+    """Display prediction results with visualizations"""
+    st.subheader("Prediction Result")
+    
+    # Display prediction
+    if prediction == 1:
+        st.success("✅ Loan Approved")
+    else:
+        st.error("❌ Loan Denied")
+    
+    # Display probabilities
+    st.write(f"Approval Probability: {probabilities[1]:.2%}")
+    st.write(f"Denial Probability: {probabilities[0]:.2%}")
+    
+    # Visualization
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.barplot(x=['Denied', 'Approved'], y=probabilities, palette=['red', 'green'], ax=ax)
+    ax.set_ylabel("Probability")
+    ax.set_title("Loan Approval Probabilities")
+    st.pyplot(fig)
+
+def display_historical_data(history):
+    """Display historical predictions with analytics"""
+    if not history.empty:
+        st.subheader("Historical Predictions")
+        st.dataframe(history)
+        
+        # Analytics
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("### Approval Rate")
+            approval_rate = history['PredictionValue'].mean()
+            st.metric("Approval Rate", f"{approval_rate:.1%}")
+            
+            fig1, ax1 = plt.subplots()
+            history['PredictionValue'].value_counts().plot(
+                kind='pie', 
+                labels=['Denied', 'Approved'],
+                autopct='%1.1f%%',
+                colors=['red', 'green'],
+                ax=ax1
+            )
+            st.pyplot(fig1)
+        
+        with col2:
+            st.write("### Feature Distributions")
+            feature = st.selectbox(
+                "Select feature to analyze",
+                ['Age', 'Income', 'CreditScore', 'LoanAmount']
+            )
+            
+            fig2, ax2 = plt.subplots()
+            sns.histplot(data=history, x=feature, hue='PredictionValue', 
+                         palette=['red', 'green'], kde=True, ax=ax2)
+            st.pyplot(fig2)
+    else:
+        st.info("No historical data available yet.")
+
+# ======================
+# MAIN APPLICATION
+# ======================
+def main():
+    # Page config
+    st.set_page_config(
+        page_title="Loan Approval Predictor",
+        page_icon="🏦",
+        layout="wide"
+    )
+    
+    # Title
+    st.title("🏦 Loan Approval Prediction System")
+    st.markdown("""
+        This application predicts whether a loan application will be approved 
+        based on applicant information. All predictions are stored in SQL Server
+        for audit and analysis.
+    """)
+    
+    # Initialize components
+    initialize_database()
+    model = load_model()
+    
+    # Main layout
+    tab1, tab2 = st.tabs(["Make Prediction", "View History"])
+    
+    with tab1:
+        # Input form
+        input_data = input_form()
+        
+        if input_data:
+            # Make prediction
+            prediction = model.predict([input_data])[0]
+            probabilities = model.predict_proba([input_data])[0]
+            
+            # Save to database
+            input_id = save_input_to_db(input_data)
+            if input_id:
+                save_prediction_to_db(input_id, prediction, probabilities)
+                display_prediction_result(prediction, probabilities)
+    
+    with tab2:
+        # Display historical data
+        history = get_historical_data()
+        display_historical_data(history)
+        
+        # Model monitoring
+        st.subheader("Model Monitoring")
+        if st.button("Calculate Model Metrics"):
+            if not history.empty:
+                # Calculate some dummy metrics (replace with actual metrics)
+                accuracy = np.random.uniform(0.85, 0.95)
+                precision = np.random.uniform(0.8, 0.9)
+                recall = np.random.uniform(0.75, 0.85)
+                
+                # Display metrics
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Accuracy", f"{accuracy:.1%}")
+                col2.metric("Precision", f"{precision:.1%}")
+                col3.metric("Recall", f"{recall:.1%}")
+                
+                # Save metrics to database (DML)
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT INTO ModelPerformance (MetricName, MetricValue)
+                            VALUES ('Accuracy', ?)
+                        """, accuracy)
+                        cursor.execute("""
+                            INSERT INTO ModelPerformance (MetricName, MetricValue)
+                            VALUES ('Precision', ?)
+                        """, precision)
+                        cursor.execute("""
+                            INSERT INTO ModelPerformance (MetricName, MetricValue)
+                            VALUES ('Recall', ?)
+                        """, recall)
+                        conn.commit()
+                        cursor.close()
+                        st.success("Model metrics saved to database!")
+                    except Exception as e:
+                        st.error(f"Failed to save metrics: {str(e)}")
+
+# Run the application
+if __name__ == "__main__":
+    main()
